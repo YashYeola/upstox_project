@@ -1,0 +1,738 @@
+================================================================================
+ STRAT TERMINAL - DEVELOPMENT LOG & TECHNICAL REFERENCE
+ Upstox Index Options Desktop Trading App (EMA 9/21, spot-driven exits)
+ Written: 2026-10-29
+================================================================================
+
+This document records everything done to build the application, from an empty
+folder to a running app, plus the design decisions, verified facts, known
+limitations and suggested next steps. Use it as the starting point for any
+future development.
+
+
+--------------------------------------------------------------------------------
+ 1. CURRENT STATUS (READ FIRST)
+--------------------------------------------------------------------------------
+
+DONE AND VERIFIED OFFLINE
+  - All five modules written and free of editor errors.
+  - 13 automated unit tests pass (fake broker, no network).
+  - A GUI smoke test builds the full window with synthetic data, draws the
+    charts, filters reports, and exports a PDF + CSV dossier successfully.
+  - The application starts (main.py) and runs without errors.
+
+NOT YET VERIFIED (needs your Upstox account)
+  - OAuth login, token caching in Windows Credential Manager.
+  - Instrument master download and real contract matching.
+  - Historical / intraday candle download from Upstox.
+  - Both WebSocket channels receiving real ticks and reconnecting.
+  - Paper fills from real option quotes.
+  - ANY live order placement, fill tracking, cancellation or exit.
+
+RECOMMENDED NEXT STEP
+  Run in PAPER mode for several full sessions (09:15-15:30) before ever arming
+  LIVE. Watch the Event Log for errors, feed reconnects and stale-data warnings.
+
+
+--------------------------------------------------------------------------------
+ 2. ORIGINAL REQUIREMENTS (SUMMARY)
+--------------------------------------------------------------------------------
+
+  - Python + CustomTkinter dark GUI + official Upstox Python SDK (v2).
+  - Modules: main.py, gui.py, strategy.py, upstox_client.py, database.py.
+  - Background threads so the GUI never freezes.
+  - Daily OAuth token cache; daily instrument master download; ATM strike map.
+  - Two WebSocket channels (A = spot index, B = active option) with exponential
+    backoff reconnect.
+  - Max 1 trade per day; ignore signals 09:15-09:30 IST.
+  - EMA 9/21 crossover (pandas-ta) on the spot chart, 100-candle padding.
+    Bullish -> buy ATM CE, bearish -> buy ATM PE.
+  - ATM = spot rounded to 50 (NIFTY) / 100 (BANKNIFTY).
+  - Exits based on SPOT price only, using ATR:
+      CE: SL spot < entry - 1.5*ATR,  TP spot > entry + 3.0*ATR
+      PE: SL spot > entry + 1.5*ATR,  TP spot < entry - 3.0*ATR
+    Exit with a MARKET order. Square-off at 15:15 IST.
+  - Timeframes 1 / 5 (default) / 15 / 30 min via dropdown.
+  - Paper mode with live option prices and 0.5% slippage.
+  - SQLite trades.db; full Indian tax ledger; metrics (Profit Factor, Sharpe,
+    Max DD %, Win/Loss, Avg Duration).
+  - Three tabs: Dashboard, Strategy & Setup, Reports & Logs; PDF/CSV export.
+
+
+--------------------------------------------------------------------------------
+ 3. DEVIATIONS FROM THE ORIGINAL SPEC (AND WHY)
+--------------------------------------------------------------------------------
+
+ 3.1 upstox_client.py renamed to upstox_broker.py  (approved by user)
+     The official SDK package is itself named "upstox_client". A local file
+     with the same name shadows it: "import upstox_client" loaded our own file
+     (verified with importlib.util.find_spec). The SDK's internal modules also
+     import "upstox_client.*", so no simple alias works. Never recreate a file
+     named upstox_client.py in this folder.
+
+ 3.2 Orders use the SDK's V3 order API (OrderApiV3 + PlaceOrderV3Request)
+     Verified on SDK 2.23: the v2 PlaceOrderRequest has NO market_protection
+     field. Upstox now requires market protection on API MARKET orders, so v2
+     market orders (including exits) would be rejected. V3 supports
+     market_protection (set to -1 = automatic) and slice (set to False).
+     V3 returns data.order_ids (a list); the code requires exactly one id.
+
+ 3.3 5-min and 15-min candles are built locally
+     The Upstox v2 historical API only offers 1minute and 30minute intraday
+     intervals. All timeframes are therefore built from 1-minute candles,
+     resampled and aligned to 09:15 IST (pandas resample, origin=start_day,
+     offset=15min).
+
+ 3.4 Instrument master uses JSON (NSE.json.gz), not CSV
+     Upstox documentation marks the CSV files as deprecated.
+
+ 3.5 PDF builder lives in database.py
+     To keep the five-module structure instead of adding a report.py.
+
+ 3.6 Safety features added beyond the spec
+     - No new entries after 15:00 IST.
+     - LIVE mode must be armed by typing "LIVE" in a dialog.
+     - Mode and index cannot be changed while a position is open.
+     - Engine "HALT" state on uncertain live entry or failed exit; must be
+       acknowledged manually after checking the broker.
+     - Signal ignored if the spot price is older than 5 seconds.
+
+
+--------------------------------------------------------------------------------
+ 4. CHRONOLOGICAL WORK LOG
+--------------------------------------------------------------------------------
+
+ Step 1  Checked workspace: folder was empty. System Python 3.13.5 found.
+
+ Step 2  Read current Upstox docs:
+         - Place order API (market_protection, X-Algo-Name note).
+         - Historical candles (v2 intervals: 1minute, 30minute, day, week, month;
+           1-minute data limited history; use intraday API for today).
+         - Instruments (JSON files, CSV deprecated, refreshed ~06:00 daily).
+         - SDK README (MarketDataStreamerV3: modes ltpc/full/..., events
+           open/close/message/error/reconnecting/autoReconnectStopped,
+           auto_reconnect(enable, interval, retryCount)).
+
+ Step 3  Wrote database.py + tests/test_database.py.
+         First test run: assertions passed but Windows could not delete the
+         temp DB because "with sqlite3.connect()" commits but does NOT close the
+         connection. Fixed by making Database.connect() a context manager that
+         always closes. Re-run: 3/3 pass.
+
+ Step 4  Wrote the broker module, requirements.txt, .gitignore.
+
+ Step 5  Created .venv and installed dependencies (see section 10).
+
+ Step 6  SDK signature check failed with "module 'upstox_client' has no
+         attribute '__version__'". Diagnosed as the module-name shadowing
+         (3.1). Asked user; user chose rename. Renamed to upstox_broker.py.
+
+ Step 7  Inspected real SDK signatures; found missing market_protection in v2
+         and switched to V3 orders (3.2). Confirmed quote last_trade_time is a
+         string and fixed timestamp parsing.
+
+ Step 8  Added per-day caching of historical candles, cut-off of incomplete
+         bars based on the last received 1-minute candle, and fee calculation
+         by actual number of orders.
+
+ Step 9  Wrote strategy.py (pure rule functions + TradingEngine) and
+         tests/test_strategy.py. Added 30-second throttle on initial candle
+         refresh retries to avoid API hammering. 13/13 tests pass.
+
+ Step 10 Wrote gui.py, moved PDF builder into database.py, wrote main.py.
+
+ Step 11 Wrote tests/smoke_gui.py; ran it. Only failure was printing the rupee
+         sign to the Windows cp1252 console; re-ran with PYTHONIOENCODING=utf-8:
+         SMOKE OK. Values checked by hand (see section 9).
+
+ Step 12 No editor errors in any module. Launched main.py: runs cleanly.
+
+ Step 13 Wrote README.md and this log. Saved repo notes to agent memory.
+
+
+--------------------------------------------------------------------------------
+ 5. FILE STRUCTURE
+--------------------------------------------------------------------------------
+
+ strat_app/
+   main.py              Entry point; logging to strat_terminal.log; builds
+                        Database + TradingEngine + App.
+   gui.py               CustomTkinter UI (3 tabs), matplotlib charts.
+   strategy.py          Indicators, signal/risk rules, TradingEngine.
+   upstox_broker.py     Official SDK wrapper: OAuth, token vault, instrument
+                        master, candles, quotes, orders, positions, WebSockets.
+   database.py          SQLite schema/journal, fee schedule, metrics,
+                        CSV export, PDF dossier.
+   requirements.txt     Pinned dependency ranges.
+   README.md            User-facing setup/run guide.
+   DEVELOPMENT_LOG.txt  This file.
+   .gitignore           Ignores .venv, caches, *.db, reports, logs.
+   tests/
+     test_database.py   3 ledger tests.
+     test_strategy.py   10 rule + engine tests.
+     smoke_gui.py       GUI/report smoke script (not a unittest; run manually).
+
+ Created at runtime (git-ignored):
+   .venv/               Virtual environment.
+   trades.db (+ -wal, -shm)  SQLite database (WAL mode).
+   .cache/NSE-YYYY-MM-DD.json.gz  Daily instrument master.
+   strat_terminal.log   Application log.
+
+
+--------------------------------------------------------------------------------
+ 6. ARCHITECTURE AND THREADING
+--------------------------------------------------------------------------------
+
+ Threads
+   - Tk main thread: GUI only. Never calls the network.
+   - "ui-io" pool (2 workers): OAuth login, broker connect/validate,
+     instrument download. Results are handed back with self.after(0, ...).
+   - "engine-loop" thread: runs every 1 s (_tick_clock): day rollover, 15:15
+     square-off, stale-spot REST fallback, bar-close scheduling.
+   - "engine" pool (4 workers): candle refresh, entry, exit.
+   - "feed-A-SPOT" and "feed-B-OPTION" threads: one per WebSocket channel.
+
+ Data flow
+   WebSocket tick -> TradingEngine._tick() -> updates State under RLock;
+   if a position is open and the spot crosses SL/TP -> request_exit().
+   GUI polls engine.snapshot() every 500 ms and drains engine.events queue
+   for the Event Log.
+
+ Concurrency guards
+   - threading.RLock protects State.
+   - threading.Event "exiting" ensures only one exit runs at a time.
+   - The daily-limit reservation is an atomic SQLite INSERT on a PRIMARY KEY
+     (day), so concurrent signals cannot both enter.
+
+
+--------------------------------------------------------------------------------
+ 7. MODULE DETAILS
+--------------------------------------------------------------------------------
+
+ 7.1 database.py
+   Tables
+     sessions(day PK, state, mode, detail)
+        One row per trading day = the daily trade slot.
+        state: RESERVED -> ENTRY_SUBMITTING (live) -> OPEN -> EXHAUSTED
+               or BLOCKED (entry failed/interrupted).
+        NOTE: the slot is per day regardless of mode: a paper trade also
+        consumes the live slot for that day.
+     trades(id, day UNIQUE, mode, status OPEN/CLOSED, payload JSON,
+            entry_time, exit_time, gross, taxes, slippage, net)
+     events(id, time, level, message)       Event log history.
+     settings(key PK, value)                 UI settings (not secrets).
+   FeeSchedule (Decimal math, rounded to paise)
+     brokerage   Rs 20 per executed order (default 2 orders per trade)
+     exchange    0.03503% of turnover (buy + sell premium)   <- ASSUMPTION
+     sebi        0.0001% of turnover (Rs 10 per crore)
+     stt         0.125% of sell premium value
+     stamp       0.003% of buy premium value
+     gst         18% of (brokerage + exchange + sebi)
+     Verify these rates periodically; exchange charges change.
+   metrics()
+     net, equity, profit_factor (inf if no losses), sharpe (daily returns,
+     sqrt(252) annualised, None until >= 2 days), max_dd %, win_loss ratio,
+     avg_duration (minutes), total taxes, total slippage, equity curve,
+     drawdown series.
+   export_csv(), build_pdf() (ReportLab, landscape A4, KPI table + full tax
+   ledger with each charge component).
+
+ 7.2 upstox_broker.py
+   SPOT_KEYS     NIFTY -> "NSE_INDEX|Nifty 50", BANKNIFTY -> "NSE_INDEX|Nifty Bank"
+   TokenVault    Stores {"day", "token"} in Windows Credential Manager
+                 (keyring, service "StratTerminal.Upstox", account = SHA-256 of
+                 API key). Token reused only if saved today (IST). Refuses to
+                 store if no secure keyring backend exists.
+   OAuthLogin    Opens the Upstox login page in the browser; runs a one-shot
+                 local HTTP server on the registered loopback redirect
+                 (default http://127.0.0.1:8765/callback); validates a random
+                 "state" value (CSRF protection); 180 s timeout; exchanges code
+                 for token via LoginApi.token.
+   round_strike  floor(price/step + 0.5) * step (exact .5 rounds up).
+   InstrumentMaster
+                 Downloads NSE.json.gz once per day to .cache (atomic write);
+                 option() picks segment NSE_FO, matching CE/PE,
+                 underlying_key = spot key, strike = ATM, nearest expiry >= today.
+                 Returns key, symbol, lot_size, strike, expiry, freeze qty.
+   aggregate_candles
+                 1-min rows -> IST index, dedupe, keep 09:15-15:29,
+                 resample to N minutes aligned to 09:15.
+   FeedChannel   One per channel. SDK auto-reconnect DISABLED; own loop:
+                 backoff 0.5 s doubling to max 30 s (reset after a connection
+                 lasts > 60 s); watchdog reconnects if no packet for 35 s.
+                 Mode "ltpc"; ticks need ltp > 0 and an ltt timestamp.
+   UpstoxBroker
+     validate()     UserApi.get_profile.
+     candles()      Past ~27 days of 1-min history (cached per index/day) +
+                    today's intraday; drops unfinished bars; requires >= 121
+                    settled bars (EMA21 + 100 padding); returns last 500.
+     quote()        Full market quote; rejects price <= 0 or trade older
+                    than 10 s.
+     market_order() V3 MARKET, product "I" (intraday), DAY, slice False,
+                    market_protection -1.
+     order_status() / order_book() / cancel() (V3) / positions().
+     stream()       Starts/replaces a named FeedChannel.
+
+ 7.3 strategy.py
+   Constants   SIGNAL_START 09:30, ENTRY_CUTOFF 15:00, SQUARE_OFF 15:15,
+               MARKET_CLOSE 15:30, SLIPPAGE 0.5%, SL 1.5 ATR, TP 3.0 ATR,
+               ATR length 14, INTERVALS {1,5,15,30}.
+   Pure functions (unit tested)
+     indicators()  ema9, ema21, atr via pandas-ta.
+     crossover()   Uses only the latest CLOSED bar; bar must be from today,
+                   start at/after 09:30, be fresh (within one interval of
+                   closing) and before 15:00. Returns "CE"/"PE"/None.
+     risk_levels() stop/target from entry spot and ATR (rejects bad ATR).
+     exit_reason() Touch-based (<= / >=) SL/TP checks on spot.
+     lots_for()    "Fixed Lots" or "Max Risk %" (full premium treated as the
+                   worst-case loss); capped by exchange freeze quantity.
+   TradingEngine
+     attach()       Recover state from DB, start feeds and loop.
+     _tick_clock()  Every second. At 15:15 requests square-off. If spot is
+                    older than 5 s during a position, polls REST quote.
+                    At each bar boundary (+3 s) runs on_bar_close().
+     on_bar_close() Refresh candles -> crossover() -> enter().
+     enter()        Checks halt/position/arming/spot freshness -> reserves the
+                    day atomically -> refreshes master if stale -> picks
+                    contract -> quotes -> sizes ->
+                      PAPER: fill = quote * 1.005
+                      LIVE:  journals ENTRY_SUBMITTING, places MARKET BUY,
+                             waits up to 20 s for fill (cancels remainder).
+                    Saves trade, starts channel B. On ANY error the day is
+                    BLOCKED (never retried); live errors also HALT.
+     _exit()        PAPER: option price (tick <= 5 s old, else REST) * 0.995.
+                    LIVE: up to 3 attempts; each attempt first reads broker
+                    positions and sells only the remaining quantity; fails ->
+                    HALT "EXIT FAILED - CLOSE POSITION MANUALLY NOW".
+                    Records fees with the actual order count.
+     recover()      Reloads an OPEN trade after restart; an interrupted
+                    entry (RESERVED/ENTRY_SUBMITTING) blocks the day and, if
+                    live, halts.
+
+ 7.4 gui.py
+   Dashboard
+     - Live Trading switch + PAPER/LIVE status bulbs.
+     - Banner: green "System Armed & Ready", amber "Daily Trade Limit
+       Exhausted - Blocked" / "Position Active", red "HALTED - ...".
+     - Cards: Live Net P&L (today's closed net + open gross P&L), Account
+       Value, Active Strike, Entry Premium, Spot Index.
+     - Target / Stop Loss progress gauges (spot vs. levels) + level details.
+     - Event Log (colour coded, last 40 events reloaded on start).
+     - Chart: candlesticks (last 90 bars) + EMA 9/21 + entry/SL/TP bands;
+       bottom pane: equity curve + drawdown % (twin axis). Redrawn only
+       when data changes.
+     - Feed status for both channels; "Acknowledge Halt" button when halted.
+   Strategy & Setup
+     - API key, secret (masked), redirect URI; Authenticate button.
+       Secret stored in Windows Credential Manager, not in the DB.
+     - Index, timeframe, sizing mode, lots/risk %, starting capital;
+       validated; saved to settings table.
+   Reports & Logs
+     - Sortable table (click headers), filters All / Win Only / Loss Only,
+       date range (YYYY-MM-DD).
+     - Metrics sidebar: Trades, Net P&L, Sharpe, Profit Factor, Max DD,
+       Win/Loss, Avg Duration, Slippage Drag, Taxes Paid.
+     - Export: PDF (also writes a CSV next to it) or CSV only.
+   Closing the window with an open position asks for confirmation because
+   exits and the 15:15 square-off stop while the app is closed.
+
+
+--------------------------------------------------------------------------------
+ 8. TESTS
+--------------------------------------------------------------------------------
+
+ Run:   .venv\Scripts\python.exe -m unittest discover -s tests -v
+ Note:  PowerShell may report exit code 1 even when all tests pass, because
+        unittest writes to stderr. Check for the final "OK".
+
+ test_database.py
+   - 20 concurrent reservations -> exactly 1 succeeds; still blocked after
+     re-opening the DB and switching to LIVE; next day allowed.
+   - Fee components for buy 100 / sell 120 / qty 50:
+       brokerage 40, exchange 3.85, sebi 0.01, stt 7.50, stamp 0.15,
+       gst 7.90 -> total 59.41.
+   - Open trade survives restart; close -> net 940.59; duration 60 min.
+ test_strategy.py
+   - Strike rounding (NIFTY 50 / BANKNIFTY 100, .5 rounds up).
+   - CE/PE risk levels and SL/TP triggers; NaN ATR rejected.
+   - Bullish -> CE, bearish -> PE; pre-09:30 bar ignored; stale and
+     unclosed bars ignored.
+   - Sizing: fixed, risk %, zero lots, freeze cap.
+   - 15-min resampling aligned to 09:15.
+   - Nearest listed expiry and correct option type chosen.
+   - Paper lifecycle: entry 100.5 (0.5% slip), levels, second signal
+     ignored, spot target exit at 119.4, banner shows limit exhausted.
+   - LIVE not armed -> no entry; stale spot -> no entry.
+   - 15:15 square-off.
+   - Restart recovers the open position.
+
+ smoke_gui.py  (run: set PYTHONIOENCODING=utf-8 and PYTHONPATH to project)
+   Synthetic 3 trades + an open position; result checked by hand:
+     Loss filter net = (85 - 100.5) * 75 - 61.16 = -1,223.66
+     Open P&L = (110 - 101.2) * 75 = 660.00
+   PDF and CSV exported successfully.
+
+
+--------------------------------------------------------------------------------
+ 9. HOW TO RUN
+--------------------------------------------------------------------------------
+
+   cd "...\strat_app"
+   .venv\Scripts\python.exe main.py
+
+ First time:
+   1. Upstox developer console: register redirect
+      http://127.0.0.1:8765/callback
+   2. Strategy & Setup tab: enter API key + secret -> Authenticate.
+   3. Choose index/timeframe/sizing -> Apply Parameters.
+   4. Stay in PAPER mode.
+
+ Rebuild the environment:
+   python -m venv .venv
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+
+--------------------------------------------------------------------------------
+ 10. ENVIRONMENT AND DEPENDENCIES
+--------------------------------------------------------------------------------
+
+ Python 3.13.5 (Windows), virtual env in .venv.
+   customtkinter >=5.2.2,<6     matplotlib >=3.9,<4
+   pandas >=2.2.3,<3            pandas-ta ==0.4.71b0
+   numpy >=2.0,<3               upstox-python-sdk >=2.23.0,<3
+   requests >=2.32.3,<3         keyring >=25.6,<26
+   reportlab >=4.2,<5           tzdata >=2025.1     Pillow >=11,<13
+
+
+--------------------------------------------------------------------------------
+ 11. VERIFIED SDK FACTS (upstox-python-sdk 2.23)
+--------------------------------------------------------------------------------
+
+   HistoryApi.get_historical_candle_data1(key, interval, to_date, from_date, "2.0")
+   HistoryApi.get_intra_day_candle_data(key, interval, "2.0")
+   MarketQuoteApi.get_full_market_quote(symbol, "2.0")
+     -> MarketQuoteSymbol.last_trade_time and timestamp are STRINGS
+   PlaceOrderRequest (v2): no market_protection field
+   PlaceOrderV3Request: ... slice, market_protection
+   OrderApiV3.place_order(body) -> data.order_ids : list[str]
+   OrderApiV3.cancel_order(order_id)
+   OrderApi.get_order_details("2.0", order_id=...)
+   PortfolioApi.get_positions("2.0")
+   LoginApi.token("2.0", code=, client_id=, client_secret=, redirect_uri=,
+                  grant_type="authorization_code")
+   MarketDataStreamerV3(api_client, keys, mode); auto_reconnect(False) used.
+
+
+--------------------------------------------------------------------------------
+ 12. KNOWN LIMITATIONS AND RISKS
+--------------------------------------------------------------------------------
+
+   - Nothing has been run against real Upstox yet (see section 1).
+   - Reconnecting a WebSocket cannot recover ticks missed during an outage;
+     a spot move through SL/TP during a gap is only seen on the next tick or
+     REST poll (stale-spot fallback polls every second after 5 s).
+   - MARKET orders can slip; market protection may cause partial/no fills.
+   - The app must stay open: no exits or 15:15 square-off while closed.
+   - Signals use REST 1-minute candles fetched ~3 s after each bar closes,
+     not candles built from WebSocket ticks.
+   - On restart, an open LIVE position is restored from the local DB only;
+     it is not reconciled against broker positions automatically.
+   - One trade slot per day shared by PAPER and LIVE.
+   - Exchange transaction charge rate (0.03503%) is an assumption.
+   - The instrument master is downloaded at connect and re-checked at entry
+     if the date changed; there is no separate scheduled 09:15 download job.
+   - Upstox algo-trading rules (registration, X-Algo-Name, static IP) were not
+     configured; check current requirements before live use.
+   - Unrealised P&L on the dashboard excludes fees.
+   - Windows console cannot print the rupee sign without
+     PYTHONIOENCODING=utf-8 (GUI is unaffected).
+
+
+--------------------------------------------------------------------------------
+ 13. SUGGESTED FUTURE DEVELOPMENT
+--------------------------------------------------------------------------------
+
+   1. Paper-trade validation over several sessions; review logs.
+   2. Reconcile broker positions/orders on startup in LIVE mode.
+   3. Use PortfolioDataStreamer for real-time order/fill updates instead of
+      polling order status.
+   4. Optional broker-side protective SL order as a backstop if the app dies.
+   5. Build bars from WebSocket ticks to remove the REST refresh delay.
+   6. Move fee rates into the settings table so they can be updated in-app.
+   7. Separate daily slots for PAPER and LIVE if that is desired.
+   8. Backtesting module reusing indicators()/crossover()/risk_levels().
+   9. Desktop/sound alerts for HALT, entry and exit.
+  10. Package as an .exe (e.g. PyInstaller) once stable.
+
+ Rules for future changes
+   - Keep strategy rules as pure functions and add a unit test for each change.
+   - Never call the network from the Tk thread.
+   - Never auto-retry a live ENTRY; only retry exits after checking positions.
+   - Do not name any local file upstox_client.py.
+================================================================================
+
+--------------------------------------------------------------------------------
+ 14. ADDENDUM 2026-10-29: BACKTEST ("DUMMY RUN") FEATURE
+--------------------------------------------------------------------------------
+
+ Purpose  Replay past days with real Upstox history using the SAME rules as
+          the live engine, and show results in the Reports tab.
+
+ Where
+   upstox_broker.py  rows_to_frame(), resample_bars() (aggregate_candles now
+                     uses them); UpstoxBroker.spot_minutes(index, start, end);
+                     UpstoxBroker.backtest_option(index, day, side, strike):
+                     finds the nearest expiry on/after `day` from
+                     ExpiredInstrumentApi.get_expiries + OptionsApi active
+                     contracts, then fetches the ATM contract's 1-min candles
+                     (expired-instruments endpoint if expired, else normal
+                     history). Results cached per run.
+   strategy.py       simulate_day() and run_backtest().
+   database.py       Database.reset() (used only on backtest.db).
+   gui.py            Reports tab: "Paper/Live | Backtest" ledger selector and
+                     a Backtest bar (From/To default = last Mon-Fri, Run).
+   backtest.db       Separate DB; cleared at the start of each run. Never
+                     touches trades.db.
+
+ Simulation rules
+   - Spot 1-min history from (start - 20 days) is resampled to the chosen
+     timeframe; >= 121 prior bars required (else the day is skipped).
+   - Signal: crossover() evaluated at each bar close + 3 s (same 09:30 filter,
+     15:00 entry cutoff, one trade per day).
+   - Entry: next minute's spot OPEN; option price = that minute's option open
+     (or last earlier close) * 1.005.
+   - Exit: walk 1-min spot bars; SL/TP via bar high/low. If both are touched
+     in the same minute, STOP_LOSS is assumed (conservative). Option exit =
+     that minute's close * 0.995. Otherwise square-off at 15:15 open.
+   - Fees: same FeeSchedule (2 orders). Sizing uses running backtest capital.
+
+ Requirements / limits
+   - Needs an Upstox login (history requires an access token).
+   - Expired-contract data may require a specific Upstox plan; if the API
+     refuses, the run reports "Expired-contract data unavailable".
+   - 1-minute bars cannot show the exact tick order inside a minute, and
+     option prices are bar opens/closes, not real fills.
+   - v2 1-minute history covers a limited recent window; very old ranges fail.
+
+ Tests  tests/test_strategy.py BacktestTests (synthetic data):
+   - bullish rally -> CE entry after 09:35 -> TARGET, 0.5% slippage both sides
+   - SL and TP in the same minute -> STOP_LOSS
+   Total suite: 15 tests, all passing.
+
+================================================================================
+
+--------------------------------------------------------------------------------
+ 15. ADDENDUM 2026-10-29: RIGOROUS, BACK-TO-BACK (B2B) AND SIL TESTING
+--------------------------------------------------------------------------------
+
+ Result: 44 tests, ALL PASSING (about 2 minutes). 3 production defects found
+ and fixed (see 15.5). No real Upstox account involved: everything runs on
+ seeded synthetic data, so results are reproducible.
+
+ How to run
+   .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+   $env:PYTHONPATH = "$PWD;$PWD\tests"
+   .venv\Scripts\python.exe -m unittest discover -s tests -v
+   Coverage:
+   .venv\Scripts\python.exe -m coverage run --branch --source=database,strategy,upstox_broker,gui,main -m unittest discover -s tests
+   .venv\Scripts\python.exe -m coverage report -m
+   More B2B seeds:  $env:B2B_SEEDS = "20"   (default 4)
+   NOTE: do not pass "-t ." to discover; tests/ is not a package and nothing
+   runs (an earlier coverage run looked like 42% only because of this).
+
+ 15.1 SIL harness  tests/sil_harness.py
+   Runs the REAL TradingEngine (no code changes) against:
+   - make_minutes(seed): seeded 1-min OHLC, ~1% daily range, drifting regimes.
+   - premium(): deterministic option price = intrinsic + bell-shaped time
+     value, 0.05 tick.
+   - SimBroker: the same interface as UpstoxBroker (candles, quote, market_order,
+     order_status, cancel, positions, stream, master). Fault injection:
+     order_faults = "reject" | "raise" | "partial" | "pending"; outage flag;
+     latency (seconds) on orders/positions.
+   - Virtual clock; each minute is stepped at seconds 0, 3, 15, 30, 45.
+     Ticks: open @0, extremes @15/@30, close @45. While a position is open
+     the ADVERSE extreme comes first (matches the backtest's SL-first rule).
+   - Option quote = price from the minute open before second 10, else from the close.
+   - SyncPool runs engine work inline for determinism (real thread pool used
+     in the concurrency tests).
+
+ 15.2 Back-to-back  tests/test_b2b.py
+   Live engine (SIL) vs run_backtest() on identical data, compared field by
+   field: day, side, strike, qty, entry minute, entry spot, SL, TP, entry
+   premium, exit minute, reason, exit premium, taxes, net.
+   - Matrix 4 seeds x {NIFTY, BANKNIFTY} x {1,5,15,30 min} = 32 one-week runs
+     -> 118 trades, all identical (CE 54, PE 64; TARGET 36, STOP_LOSS 70,
+     SQUARE_OFF_1515 12). Asserts every side/exit reason is exercised.
+   - Max Risk % sizing case (multi-lot) identical.
+   - Short-history case (warm-up boundary inside the week) identical
+     after fix D1.
+
+ 15.3 SIL scenarios  tests/test_sil.py (12 tests)
+   PaperWeek    1 trade/day max, entry >= 09:35 and < 15:00, exit <= 15:15,
+                ATM within 25 pts, net = gross - taxes, no ERROR events.
+   LiveSIL      happy path (1 BUY + 1 SELL per trade, book flat, Rs 40 brokerage);
+                entry rejected -> HALT, day BLOCKED, never retried all week;
+                entry network error -> HALT; partial fill -> trades filled
+                qty and exits it; entry never fills -> cancelled, HALT;
+                exit rejected once -> 2nd SELL fills, Rs 60 brokerage;
+                exit keeps failing -> exactly 3 SELLs, HALT, CRITICAL,
+                trade stays OPEN, no further orders all week.
+   Recovery     restart mid-trade -> identical trades to an uninterrupted run;
+                45-min feed outage -> REST fallback used, trade still exits.
+   Concurrency  12 simultaneous exit triggers -> exactly 1 SELL;
+                forced interleaving (slowed guard) -> exactly 1 SELL.
+
+ 15.4 Property-based + component tests
+   tests/test_properties.py (Hypothesis, 60-400 random cases each):
+     fees (components sum, formulae, non-negative, monotonic), strike
+     rounding, SL/TP geometry and triggers, invalid ATR rejected, sizing
+     never exceeds risk budget / freeze, resampling OHLC consistency +
+     09:15 alignment + volume conservation + duplicate/gap tolerance,
+     crossover only on a fresh sign change in the 09:30-15:00 window, metrics
+     (equity, max DD, profit factor, duration).
+   tests/test_components.py:
+     FeedChannel reconnect backoff 1s, 2s ... with SDK auto-reconnect off,
+     zero-price ticks dropped; OAuth rejects non-loopback/port-less redirects
+     and a forged "state" (HTTP 400) and exchanges only the valid code;
+     TokenVault reuses only today's token; account id is hashed.
+
+ 15.5 Defects found and fixed
+   D1 (B2B)  Warm-up rule differed: the engine allowed trading once >= 121
+             settled bars existed (counting today's bars); the backtest required
+             121 bars BEFORE the day and skipped the whole day. Backtest now
+             checks the same rule per bar (strategy.simulate_day).
+   D2 (SIL)  CRITICAL: after an exit failure HALT, every new tick retried the
+             exit -> 51 SELL orders in the test; while you close the position by
+             hand this could leave you short. Fix: request_exit() sends no
+             orders while HALTED (clearing the halt in the GUI re-enables it).
+   D3 (SIL)  CRITICAL race: request_exit() checked then set the "exiting" flag
+             non-atomically; 6 simultaneous triggers -> 6 SELL orders. Fix:
+             check-and-set under the engine lock.
+   Test-side fixes during development: harness clock not initialised,
+   OAuth test asserted before its helper thread finished (passed alone,
+   failed under full-suite load).
+
+ 15.6 Coverage (branch, full suite + GUI smoke)
+   database.py 98%   strategy.py 84%   gui.py 70%   upstox_broker.py 56%
+   TOTAL 75%.
+   Not covered: UpstoxBroker methods that call the real SDK (orders,
+   candles, quotes, instrument download, backtest option fetch) and GUI
+   dialogs. These need a real Upstox session; verify them in PAPER mode.
+
+ 15.7 Known gap (not fixed, needs a design decision)
+   After an exit-failure HALT, if you flatten the position by hand and
+   acknowledge the halt, the next exit attempt sees a flat book with no
+   confirmed fill and halts again; the DB trade stays OPEN. A
+   "reconcile/mark closed manually" action with a user-entered exit price is
+   needed.
+
+================================================================================
+--------------------------------------------------------------------------------
+ 16. ADDENDUM 2026-10-29: FEATURE RELEASE (12 features + 1 security fix)
+--------------------------------------------------------------------------------
+
+ Result: 68 automated tests, all passing; GUI smoke test passing; Windows .exe
+ build (see 16.10). B2B matrix unchanged: 32 runs / 118 trades identical, so the
+ refactor did not change default behaviour.
+
+ 16.0 SECURITY FIX (found while integrating the portfolio stream)
+   upstox-python-sdk's websocket feeders (market data AND portfolio) call
+   run_forever(sslopt={"cert_reqs": CERT_NONE, "check_hostname": False}) while
+   sending "Authorization: Bearer <token>" -> token theft possible on hostile
+   networks. upstox_broker._enforce_websocket_tls() subclasses
+   websocket.WebSocketApp at import time and forces CERT_REQUIRED +
+   check_hostname + certifi CA bundle. REST already verified TLS
+   (Configuration.verify_ssl=True). Test: TransportAndStreams.test_websocket_tls_is_forced_on.
+   Re-check this whenever the SDK is upgraded.
+
+ 16.1 Separate PAPER / LIVE daily limit
+   sessions PK and trades UNIQUE are now (day, mode). Database._migrate()
+   converts v1 databases in place (copies rows, drops old tables); idempotent.
+   API change: session(day, mode), session_state(day, mode, state, detail),
+   active_trade(mode=None).
+
+ 16.2 Editable strategy parameters (strategy.Params, frozen dataclass)
+   ema_fast/ema_slow, atr_length, sl_atr/tp_atr, signal_start/entry_cutoff/
+   square_off (HH:MM), slippage_pct, trend_filter, trend_ema, adx_length,
+   adx_min, bar_source, backstop, backstop_pct. validate() enforces ranges and
+   09:15 <= start < cutoff <= square-off < 15:30. warmup = longest indicator +
+   100 (default 121, unchanged). Stored as JSON in settings key "params".
+   Each trade stores the params used (trade["params"]). Exit reason for the
+   time exit is SQUARE_OFF_<HHMM>. Old constants (SIGNAL_START, SLIPPAGE, ...)
+   and indicator columns ema9/ema21 were replaced by Params and
+   ema_fast/ema_slow.
+
+ 16.3 Trend filter (Off / EMA / ADX / EMA+ADX)
+   EMA: CE needs close > trend EMA, PE needs close < trend EMA. ADX: ADX >= min.
+   NaN indicator -> no trade. VWAP/volume filter NOT possible: NSE index spot
+   has no traded volume (documented in the GUI).
+
+ 16.4 Tick-built bars (bar_source "Ticks", default)
+   TickBars aggregates feed-A ticks into 1-min OHLC. A bar is used only if every
+   minute has ticks and the first tick of the bar's first minute is <= 30 s
+   late; otherwise on_bar_close falls back to REST candles. The tick bar is
+   appended to the last REST frame only if it is contiguous (no gap).
+   Measured: >5x fewer REST candle calls; identical trades to REST bars.
+
+ 16.5 Real-time order updates
+   upstox_broker.OrderStream (PortfolioDataStreamer, same backoff, no packet
+   watchdog because the socket is silent when idle). UpstoxBroker caches
+   updates; order_status() returns a cached terminal state, else REST;
+   _await_fill() waits on the update condition instead of sleeping.
+
+ 16.6 Broker-side protective stop-loss ("backstop", LIVE only, default on)
+   After a filled live entry: SELL SL-limit (SL-M is not allowed for NSE
+   options) with trigger = entry premium x (1 - backstop_pct), limit = 90 % of
+   trigger, 0.05 tick. Any app exit first cancels it and WAITS for a terminal
+   state (5 s); if it cannot be confirmed the exit aborts and HALTS (prevents a
+   double SELL / naked short). Its own fills are counted in the exit. If the
+   exchange fires it, the order update triggers an exit that records
+   BACKSTOP_SL without sending another SELL. Placement failure only warns.
+   Limitation: a gap through the limit price can leave it unfilled.
+
+ 16.7 Live startup reconciliation + Manual close
+   reconcile() (on attach when LIVE is relevant, on switching to LIVE, and via
+   the Reconcile button): app open but broker flat; quantity mismatch;
+   untracked position from today's app-tagged BUY -> HALT + CRITICAL.
+   manual_close(price): refuses bad prices, refuses LIVE unless the broker is
+   flat (cancels backstop first), records MANUAL_CLOSE, clears HALT.
+   Closes gap 15.7.
+
+ 16.8 Fee-aware live P&L, alerts
+   unrealized_net() subtracts estimated round-trip charges; dashboard says so.
+   Fix found during this work: brokerage was charged for every SELL attempt,
+   including rejected ones; now only executed orders are counted (rejected
+   exit + filled retry = Rs 40, not Rs 60).
+   Alerts: non-blocking corner toasts + Windows sounds for TRADE, CRITICAL and
+   feed reconnects, throttled to once per 60 s per message; dashboard toggle.
+   The previous blocking CRITICAL messagebox was removed.
+
+ 16.9 Backtest parameter sweep
+   sweep_grid() (invalid combos skipped, max 300) and run_sweep(): one spot
+   download, option data cached per (day, side, strike), indicators computed
+   once per combination, cancellable, ranked by Sharpe -> profit factor -> net.
+   GUI: Reports -> "Parameter Sweep..." window with "Apply Best to Strategy".
+   Verified: the top result equals a normal run_backtest() with those params.
+
+ 16.10 Windows .exe
+   strat_terminal.spec (PyInstaller onedir, windowed). Data folder when frozen:
+   %LOCALAPPDATA%\StratTerminal (main.data_dir); fixed a latent bug where the
+   instrument cache used the current working directory.
+   Build: .venv\Scripts\python.exe -m PyInstaller strat_terminal.spec --noconfirm
+
+ 16.11 Tests added (tests/test_features.py, 23) and updated
+   Backstop placement/cancel, exchange-fired backstop, stuck cancel refuses
+   SELL, backstop off; reconcile pass/flat/qty/untracked; manual close after
+   HALT and validation; per-mode slot; TickBars coverage rules; ticks vs REST
+   identical; tick fallback on outage; Params validation/warm-up; trend_ok;
+   short-history NaN safety; B2B with custom params and every trend filter;
+   sweep grid limits and sweep == individual backtest; TLS enforcement;
+   order-stream parsing; fee-aware P&L; v1 DB migration; GUI smoke covers
+   param validation, alert throttling and the sweep window.
+
+ 16.12 Still not verified against a real Upstox account
+   Portfolio stream message delivery, SL order acceptance/rejection rules for
+   your account, expired-contract data access, and the .exe on another PC.
+   Paper-trade first; enable LIVE only after a clean paper week.
+
+================================================================================
